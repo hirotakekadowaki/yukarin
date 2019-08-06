@@ -109,7 +109,7 @@ def objective(trial):
         print('it:', num, ' / acc:', accuracy, ' / loss:', loss)
     trainer.extend(savemodel)
     
-    trainer.extend(ChainerPruningExtension(trial, 'discriminator/loss', (config.train.snapshot_iteration, 'iteration')))
+    trainer.extend(ChainerPruningExtension(trial, 'test/discriminator/loss', (config.train.snapshot_iteration, 'iteration')))
     trainer.extend(ChainerPruningExtension(trial, 'discriminator/accuracy', (config.train.snapshot_iteration, 'iteration')))
     
     trainer.run()
