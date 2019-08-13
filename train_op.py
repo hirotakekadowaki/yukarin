@@ -127,7 +127,7 @@ def train(trial):
         return training.triggers.EarlyStoppingTrigger(
                     check_trigger=trigger_snapshot, 
                     monitor='discriminator/accuracy', 
-                    patients=1,
+                    patients=3,
                     mode='max',
                     verbose=False, 
                     max_trigger=trigger_snapshot100)
@@ -136,7 +136,7 @@ def train(trial):
         return training.triggers.EarlyStoppingTrigger(
                     check_trigger=trigger_snapshot, 
                     monitor='test/predictor/loss', 
-                    patients=1,
+                    patients=3,
                     mode='min',
                     verbose=False, 
                     max_trigger=trigger_snapshot100)
