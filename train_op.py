@@ -33,7 +33,14 @@ config = create_from_json(arguments.config_json_path)
 arguments.output.mkdir(exist_ok=True)
 config.save_as_json((arguments.output / 'config.json').absolute())
 
-def objective(trial):
+# optuna directory
+optuna_dir = Path(arguments.output)/'optuna'
+optuna_dir.mkdir(exist_ok=True)
+db_file = optuna_dir/'optuna_param.db'
+tr_file = optuna_dir/'trainer.npz'
+ACC_TH = 0.99
+
+def train(trial):
     # model
     if config.train.gpu >= 0:
         cuda.get_device_from_id(config.train.gpu).use()
@@ -48,22 +55,47 @@ def objective(trial):
 
     # dataset
     dataset = create_dataset(config.dataset)
-    batchsize = trial.suggest_int('batchsize', 1, 128)
+    
+    if trial.number == 0:
+        defbatch = config.train.batchsize
+        batchsize = trial.suggest_int('batchsize', defbatch, defbatch)
+    else:
+        batchsize = trial.suggest_int('batchsize', 1, 128)
+        
     train_iter = MultiprocessIterator(dataset['train'], batchsize)
+    
     test_iter = MultiprocessIterator(dataset['test'], batchsize, repeat=False, shuffle=False)
     train_eval_iter = MultiprocessIterator(dataset['train_eval'], batchsize, repeat=False, shuffle=False)
-
+        
     # optimizer
     def create_optimizer(model):
-        alpha = trial.suggest_loguniform('alpha', 1e-6, 1e-2)
-        beta1 = trial.suggest_uniform('beta1', 0, 1)
-        beta2 = trial.suggest_uniform('beta2', 0, 1)
-        optimizer = optimizers.Adam(alpha, beta1, beta2, eps=10**-7)
+        cp: Dict[str, Any] = copy(config.train.optimizer)
+        n = cp.pop('name').lower()
+
+        if n == 'adam':
+            if trial.number == 0:
+                a = cp.pop('alpha')
+                b1 = cp.pop('beta1')
+                b2 = cp.pop('beta2')
+                alpha = trial.suggest_loguniform('alpha', a, a)
+                beta1 = trial.suggest_uniform('beta1', b1, b1)
+                beta2 = trial.suggest_uniform('beta2', b2, b2)
+                optimizer = optimizers.Adam(alpha, beta1, beta2, eps=10**-7)
+            else :
+                alpha = trial.suggest_loguniform('alpha', 1e-6, 1e-2)
+                beta1 = trial.suggest_uniform('beta1', 0, 1)
+                beta2 = trial.suggest_uniform('beta2', 0, 1)
+                optimizer = optimizers.Adam(alpha, beta1, beta2, eps=10**-7)
+        elif n == 'sgd':
+            optimizer = optimizers.SGD(**cp)
+        else:
+            raise ValueError(n)
+            
         optimizer.setup(model)
         return optimizer
     
     opts = {key: create_optimizer(model) for key, model in models.items()}
-
+    
     # updater
     converter = partial(convert.concat_examples, padding=0)
     updater = Updater(
@@ -79,9 +111,27 @@ def objective(trial):
     # trainer
     trigger_log = (config.train.log_iteration, 'iteration')
     trigger_snapshot = (config.train.snapshot_iteration, 'iteration')
-    trigger_stop = (config.train.stop_iteration, 'iteration') if config.train.stop_iteration is not None else None
-
-    trainer = training.Trainer(updater, stop_trigger=trigger_stop, out=arguments.output)
+    trigger_snapshot100 = ((int)(config.train.snapshot_iteration*100), 'iteration')
+    
+    def get_acc_trigger():
+        return training.triggers.EarlyStoppingTrigger(
+                    check_trigger=trigger_snapshot, 
+                    monitor='discriminator/accuracy', 
+                    patients=3,
+                    mode='max',
+                    verbose=False, 
+                    max_trigger=trigger_snapshot100)
+                    
+    def get_loss_trigger():
+        return training.triggers.EarlyStoppingTrigger(
+                    check_trigger=trigger_snapshot, 
+                    monitor='test/predictor/loss', 
+                    patients=3,
+                    mode='min',
+                    verbose=False, 
+                    max_trigger=trigger_snapshot100)
+    
+    trainer = training.Trainer(updater, stop_trigger=get_loss_trigger(), out=arguments.output)
     tb_writer = SummaryWriter(Path(arguments.output))
 
     ext = extensions.Evaluator(test_iter, models, converter, device=config.train.gpu, eval_func=updater.forward)
@@ -90,37 +140,66 @@ def objective(trial):
     trainer.extend(ext, name='train', trigger=trigger_log)
 
     trainer.extend(extensions.dump_graph('predictor/loss'))
-
+    
     ext = extensions.snapshot_object(predictor, filename='predictor_{.updater.iteration}.npz')
-    trainer.extend(ext, trigger=trigger_snapshot)
+    trainer.extend(ext, name='snapshot', trigger=get_acc_trigger())
 
     trainer.extend(extensions.LogReport(trigger=trigger_log))
-    trainer.extend(TensorBoardReport(writer=tb_writer), trigger=trigger_log)
-
-    if trigger_stop is not None:
-        trainer.extend(extensions.ProgressBar(trigger_stop))
-
-    trigger_save = (config.train.snapshot_iteration, 'iteration')
-    @training.make_extension(trigger=trigger_save)
-    def savemodel(trainer):
+    trainer.extend(TensorBoardReport(writer=tb_writer), trigger=trigger_snapshot)
+    
+    # acc
+    @training.make_extension(trigger=get_acc_trigger())
+    def save_trainer_stop(trainer):
+        accuracy = trainer.observation['discriminator/accuracy']
+        if accuracy > ACC_TH:
+            print('save trainer data!!!')
+            chainer.serializers.save_npz(tr_file, trainer, compression=False)
+        
+    trainer.extend(save_trainer_stop)
+    
+    # loss
+    @training.make_extension(trigger=get_loss_trigger())
+    def next_trainer_stop(trainer):
+        num = trainer.updater.iteration
+        loss = trainer.observation['test/predictor/loss']
+        print('losstrigger it:', num, ' / loss:', loss)
+        accuracy = trainer.observation['discriminator/accuracy']
+        if accuracy > ACC_TH:
+            print('save trainer data!!!')
+            chainer.serializers.save_npz(tr_file, trainer, compression=False)
+            
+    trainer.extend(next_trainer_stop)
+    
+    @training.make_extension(trigger=trigger_snapshot)
+    def logacc(trainer):
         num = trainer.updater.iteration
         accuracy = trainer.observation['discriminator/accuracy']
         loss = trainer.observation['discriminator/loss']
         print('it:', num, ' / acc:', accuracy, ' / loss:', loss)
-    trainer.extend(savemodel)
+    trainer.extend(logacc)
     
-    trainer.extend(ChainerPruningExtension(trial, 'test/discriminator/loss', (config.train.snapshot_iteration, 'iteration')))
     trainer.extend(ChainerPruningExtension(trial, 'discriminator/accuracy', (config.train.snapshot_iteration, 'iteration')))
     
+    if tr_file.exists():
+        chainer.serializers.load_npz(tr_file, trainer, '', strict=False)
+        alpha = trial.suggest_loguniform('alpha', 1e-6, 1e-2)
+        beta1 = trial.suggest_uniform('beta1', 0, 1)
+        beta2 = trial.suggest_uniform('beta2', 0, 1)
+        opt = trainer.updater.get_optimizer('predictor')
+        opt.alpha = alpha
+        opt.beta1 = beta1
+        opt.beta2 = beta2
+        
     trainer.run()
     
     accuracy = trainer.observation['discriminator/accuracy']
-    
-    print('completed! / acc:', accuracy)
-
+    print('optuna next train! / acc:', accuracy)
     return 1.0 - float(accuracy)
-    
-pruner = optuna.pruners.MedianPruner(n_warmup_steps=config.train.snapshot_iteration)
-study = optuna.study.create_study(storage='sqlite:///example.db', pruner=pruner, study_name='mnist', load_if_exists=True)
-study.optimize(objective, n_trials=100)
+
+if __name__ == '__main__':   
+    pruner = optuna.pruners.MedianPruner(n_warmup_steps=config.train.snapshot_iteration)
+    dbname = 'sqlite:///'+str(db_file.absolute())
+    study = optuna.study.create_study(storage=dbname, pruner=pruner, study_name='yukarin', load_if_exists=True)
+    study.optimize(train, n_trials=100)
+    study.trials_dataframe()[('params', 'alpha')].plot()
 
