@@ -39,6 +39,7 @@ optuna_dir.mkdir(exist_ok=True)
 db_file = optuna_dir/'optuna_param.db'
 tr_file = optuna_dir/'trainer.npz'
 ACC_TH = 0.99
+OP_COMP = optuna.structs.TrialState.COMPLETE
 
 def train(trial):
     # model
@@ -60,7 +61,10 @@ def train(trial):
         defbatch = config.train.batchsize
         batchsize = trial.suggest_int('batchsize', defbatch, defbatch)
     else:
-        batchsize = trial.suggest_int('batchsize', 1, 128)
+        if hasattr(trial, 'state') and trial.state == OP_COMP:
+            batchsize = trial.params['batchsize']
+        else:
+            batchsize = trial.suggest_int('batchsize', 1, 128)
         
     train_iter = MultiprocessIterator(dataset['train'], batchsize)
     
@@ -82,9 +86,15 @@ def train(trial):
                 beta2 = trial.suggest_uniform('beta2', b2, b2)
                 optimizer = optimizers.Adam(alpha, beta1, beta2, eps=10**-7)
             else :
-                alpha = trial.suggest_loguniform('alpha', 1e-6, 1e-2)
-                beta1 = trial.suggest_uniform('beta1', 0, 1)
-                beta2 = trial.suggest_uniform('beta2', 0, 1)
+                if hasattr(trial, 'state') and trial.state == OP_COMP:
+                    alpha = trial.params['alpha']
+                    beta1 = trial.params['beta1']
+                    beta2 = trial.params['beta2']
+                else:
+                    alpha = trial.suggest_loguniform('alpha', 1e-6, 1e-2)
+                    beta1 = trial.suggest_uniform('beta1', 0, 1)
+                    beta2 = trial.suggest_uniform('beta2', 0, 1)
+                    
                 optimizer = optimizers.Adam(alpha, beta1, beta2, eps=10**-7)
         elif n == 'sgd':
             optimizer = optimizers.SGD(**cp)
@@ -117,7 +127,7 @@ def train(trial):
         return training.triggers.EarlyStoppingTrigger(
                     check_trigger=trigger_snapshot, 
                     monitor='discriminator/accuracy', 
-                    patients=3,
+                    patients=1,
                     mode='max',
                     verbose=False, 
                     max_trigger=trigger_snapshot100)
@@ -126,7 +136,7 @@ def train(trial):
         return training.triggers.EarlyStoppingTrigger(
                     check_trigger=trigger_snapshot, 
                     monitor='test/predictor/loss', 
-                    patients=3,
+                    patients=1,
                     mode='min',
                     verbose=False, 
                     max_trigger=trigger_snapshot100)
@@ -139,6 +149,7 @@ def train(trial):
     ext = extensions.Evaluator(train_eval_iter, models, converter, device=config.train.gpu, eval_func=updater.forward)
     trainer.extend(ext, name='train', trigger=trigger_log)
 
+    #if hasattr(trial, 'state') and trial.state == OP_COMP:
     trainer.extend(extensions.dump_graph('predictor/loss'))
     
     ext = extensions.snapshot_object(predictor, filename='predictor_{.updater.iteration}.npz')
@@ -178,13 +189,21 @@ def train(trial):
         print('it:', num, ' / acc:', accuracy, ' / loss:', loss)
     trainer.extend(logacc)
     
-    trainer.extend(ChainerPruningExtension(trial, 'discriminator/accuracy', (config.train.snapshot_iteration, 'iteration')))
+    if not hasattr(trial, 'state'):
+        trainer.extend(ChainerPruningExtension(trial, 'discriminator/accuracy', (config.train.snapshot_iteration, 'iteration')))
     
     if tr_file.exists():
         chainer.serializers.load_npz(tr_file, trainer, '', strict=False)
-        alpha = trial.suggest_loguniform('alpha', 1e-6, 1e-2)
-        beta1 = trial.suggest_uniform('beta1', 0, 1)
-        beta2 = trial.suggest_uniform('beta2', 0, 1)
+        if hasattr(trial, 'state') and trial.state == OP_COMP:
+            alpha = trial.params['alpha']
+            beta1 = trial.params['beta1']
+            beta2 = trial.params['beta2']
+        else:
+            alpha = trial.suggest_loguniform('alpha', 1e-6, 1e-2)
+            beta1 = trial.suggest_uniform('beta1', 0, 1)
+            beta2 = trial.suggest_uniform('beta2', 0, 1)
+            
+        print(alpha, beta1, beta2)
         opt = trainer.updater.get_optimizer('predictor')
         opt.alpha = alpha
         opt.beta1 = beta1
@@ -200,6 +219,9 @@ if __name__ == '__main__':
     pruner = optuna.pruners.MedianPruner(n_warmup_steps=config.train.snapshot_iteration)
     dbname = 'sqlite:///'+str(db_file.absolute())
     study = optuna.study.create_study(storage=dbname, pruner=pruner, study_name='yukarin', load_if_exists=True)
+    
     study.optimize(train, n_trials=100)
     study.trials_dataframe()[('params', 'alpha')].plot()
+    # train
+    train(study.best_trial)
 
